@@ -37,7 +37,7 @@ const COPILOT_CAPABILITIES: AgentCapabilityFlags = {
 
 const COPILOT_AGENT_MODE_ID = "https://agentclientprotocol.com/protocol/session-modes#agent";
 const COPILOT_PLAN_MODE_ID = "https://agentclientprotocol.com/protocol/session-modes#plan";
-export const COPILOT_AUTOPILOT_MODE_ID =
+const COPILOT_AUTOPILOT_MODE_ID =
   "https://agentclientprotocol.com/protocol/session-modes#autopilot";
 export const COPILOT_ALLOW_ALL_MODE_ID = "allow-all";
 const COPILOT_ALLOW_ALL_CONFIG_ID = "allow_all";
