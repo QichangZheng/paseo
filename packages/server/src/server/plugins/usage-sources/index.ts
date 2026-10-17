@@ -33,6 +33,8 @@ interface KnownReport {
 export interface AgentUsageLookup {
   hasAgent(id: string): boolean;
   usageSession(id: string): AgentUsageSession | null;
+  /** Enabled providers that set their own env. Host listings discover these like a session. */
+  providerEnvironments?(): Array<Pick<AgentUsageSession, "provider" | "env">>;
 }
 
 export interface ListUsageReportsOptions {
@@ -96,7 +98,18 @@ export class UsageSourceRegistry {
     } else if (options.reportIds !== undefined) {
       ids = options.reportIds;
     } else {
-      this.defaults = await this.discover({ kind: "global" });
+      // A provider's own env can name a login the daemon's env doesn't, so list it before any of
+      // its agents runs. The host's own logins come first in each account's fallback order.
+      const scopes: UsageScope[] = [
+        { kind: "global" },
+        ...(this.agents.providerEnvironments?.() ?? []).map(
+          ({ provider, env }): UsageScope => ({ kind: "session", provider, env }),
+        ),
+      ];
+      const defaults = new Map<string, KnownReport>();
+      for (const discovered of await Promise.all(scopes.map((scope) => this.discover(scope))))
+        mergeReports(defaults, discovered);
+      this.defaults = defaults;
       this.mergeKnown();
       ids = [...this.known.keys()];
     }
@@ -155,18 +168,10 @@ export class UsageSourceRegistry {
       this.defaults,
       ...[...this.byAgent.values()].map((agent) => agent.reports),
     ]) {
-      for (const [id, report] of reports) {
-        if (this.sources.get(report.source.id) !== report.source) continue;
-        const known = this.known.get(id);
-        if (!known) {
-          this.known.set(id, { ...report, logins: [...report.logins] });
-          continue;
-        }
-        for (const login of report.logins) {
-          if (!known.logins.some((existing) => loginKey(existing) === loginKey(login)))
-            known.logins.push(login);
-        }
-      }
+      mergeReports(
+        this.known,
+        [...reports].filter(([, report]) => this.sources.get(report.source.id) === report.source),
+      );
     }
   }
 
@@ -336,6 +341,24 @@ function legacyError(report: UsageReport, now: number): string | null {
   if (report.status === "error") return report.error;
   if (report.status === "unavailable") return legacyProblem(report.problem, now);
   return null;
+}
+
+// An account found in several scopes is one report; its logins keep discovery order, once each.
+function mergeReports(
+  into: Map<string, KnownReport>,
+  reports: Iterable<[string, KnownReport]>,
+): void {
+  for (const [id, report] of reports) {
+    const known = into.get(id);
+    if (!known) {
+      into.set(id, { ...report, logins: [...report.logins] });
+      continue;
+    }
+    for (const login of report.logins) {
+      if (!known.logins.some((existing) => loginKey(existing) === loginKey(login)))
+        known.logins.push(login);
+    }
+  }
 }
 
 // Inputs are opaque JSON locators. Canonical equality deduplicates discovery across scopes.

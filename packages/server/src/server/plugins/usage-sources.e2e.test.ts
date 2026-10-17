@@ -12,6 +12,43 @@ const subprocessDirectory = fileURLToPath(
   new URL("./test-fixtures/usage-source-directory/", import.meta.url),
 );
 
+async function json(file: string, value: unknown) {
+  await mkdir(path.dirname(file), { recursive: true });
+  await writeFile(file, JSON.stringify(value));
+}
+
+/** The real Claude and Codex readers, compiled as built-ins, with home, env and HTTP injected. */
+async function injectedUsageSources(
+  root: string,
+  lookup: { home: string; env: Record<string, string> },
+  fetchApi: string,
+): Promise<BuiltinPluginLoader> {
+  const plugins = path.join(root, "plugins");
+  for (const source of ["codex", "claude"]) {
+    const directory = path.join(plugins, `${source}-usage-source`);
+    await cp(path.join(resolveBuiltinPluginsRoot(), `${source}-usage-source`), directory, {
+      recursive: true,
+    });
+    await writeFile(
+      path.join(directory, "index.server.ts"),
+      `
+import { inputSchema } from './shared/input.js';
+import { discover, fetchUsage } from './server/usage.js';
+const lookup = { home: ${JSON.stringify(lookup.home)}, env: ${JSON.stringify(lookup.env)}, platform: 'linux' };
+${fetchApi}
+export default function contribute(server) {
+  server.registerUsageSource({ id: '${source}', label: '${source}', input: inputSchema,
+    discover: (scope) => discover(scope, lookup${source === "claude" ? ", fetchApi" : ""}),
+    fetch: (input) => fetchUsage(inputSchema.parse(input), fetchApi, lookup),
+  });
+  return () => {};
+}
+`,
+    );
+  }
+  return new BuiltinPluginLoader(plugins, ["codex-usage-source", "claude-usage-source"]);
+}
+
 test("lists built-in and subprocess usage; validates input and isolates fetch errors", async () => {
   const daemon = await createTestPaseoDaemon({
     daemonVersion: "0.9.2",
@@ -153,13 +190,8 @@ export default function contribute(server) {
 test("built-in sources deduplicate cross-harness accounts and fall back without session wiring", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "usage-cross-harness-"));
   const home = path.join(root, "home");
-  const plugins = path.join(root, "plugins");
   const codexHome = path.join(home, ".codex");
   const env = { CODEX_HOME: codexHome };
-  async function json(file: string, value: unknown) {
-    await mkdir(path.dirname(file), { recursive: true });
-    await writeFile(file, JSON.stringify(value));
-  }
   async function codexToken(token: string) {
     await json(path.join(codexHome, "auth.json"), {
       tokens: { access_token: token, account_id: "chatgpt-one" },
@@ -201,19 +233,10 @@ test("built-in sources deduplicate cross-harness accounts and fall back without 
     JSON.stringify({ access: "fixture-omp-claude", expires: Date.now() + 60_000 }),
   );
   db.close();
-  for (const source of ["codex", "claude"]) {
-    const directory = path.join(plugins, `${source}-usage-source`);
-    await cp(path.join(resolveBuiltinPluginsRoot(), `${source}-usage-source`), directory, {
-      recursive: true,
-    });
-    // Inject home/env/HTTP at the source boundary; compile and register the real readers.
-    await writeFile(
-      path.join(directory, "index.server.ts"),
-      `
-import { inputSchema } from './shared/input.js';
-import { discover, fetchUsage } from './server/usage.js';
-const lookup = { home: ${JSON.stringify(home)}, env: ${JSON.stringify(env)}, platform: 'linux' };
-async function fetchApi(url, init) {
+  const builtinPlugins = await injectedUsageSources(
+    root,
+    { home, env },
+    `async function fetchApi(url, init) {
   const token = new Headers(init.headers).get('Authorization');
   if (String(url).endsWith('/profile')) {
     const second = token === 'Bearer fixture-pi-claude';
@@ -222,21 +245,9 @@ async function fetchApi(url, init) {
   if (token === 'Bearer fixture-revoked') return new Response(null, { status: 401 });
   const used = { 'Bearer fixture-codex': 11, 'Bearer fixture-opencode': 22, 'Bearer fixture-pi-codex': 33, 'Bearer fixture-omp-codex': 44, 'Bearer fixture-omp-claude': 66, 'Bearer fixture-pi-claude': 77 }[token] || 55;
   return new Response(JSON.stringify({ rate_limit: { primary_window: { used_percent: used } }, five_hour: { utilization: used } }));
-}
-export default function contribute(server) {
-  server.registerUsageSource({ id: '${source}', label: '${source}', input: inputSchema,
-    discover: (scope) => discover(scope, lookup${source === "claude" ? ", fetchApi" : ""}),
-    fetch: (input) => fetchUsage(inputSchema.parse(input), fetchApi, lookup),
-  });
-  return () => {};
-}
-`,
-    );
-  }
-  const daemon = await createTestPaseoDaemon({
-    pluginsEnabled: false,
-    builtinPlugins: new BuiltinPluginLoader(plugins, ["codex-usage-source", "claude-usage-source"]),
-  });
+}`,
+  );
+  const daemon = await createTestPaseoDaemon({ pluginsEnabled: false, builtinPlugins });
   const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
   try {
     await client.connect();
@@ -280,6 +291,88 @@ export default function contribute(server) {
     expect((await refresh())?.report.windows[0]?.usedPct).toBe(44);
     await codexToken("fixture-codex");
     expect((await refresh())?.report.windows[0]?.usedPct).toBe(11);
+  } finally {
+    await client.close();
+    await daemon.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+test("#3589: host usage lists each enabled provider's own login without an agent", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "usage-provider-env-"));
+  const home = path.join(root, "home");
+  const dir = (name: string) => path.join(root, name);
+  await json(path.join(home, ".claude", ".credentials.json"), {
+    claudeAiOauth: { accessToken: "fixture-default" },
+  });
+  await json(path.join(home, ".codex", "auth.json"), {
+    tokens: { access_token: "fixture-codex", account_id: "chatgpt-default" },
+  });
+  // claude-same holds the default account's login in another directory.
+  for (const name of ["work", "same", "off"]) {
+    await json(path.join(dir(`claude-${name}`), ".credentials.json"), {
+      claudeAiOauth: { accessToken: `fixture-${name}` },
+    });
+  }
+  await json(path.join(dir("codex-work"), "auth.json"), {
+    tokens: { access_token: "fixture-codex-work", account_id: "chatgpt-work" },
+  });
+  const builtinPlugins = await injectedUsageSources(
+    root,
+    { home, env: {} },
+    `async function fetchApi(url, init) {
+  const token = new Headers(init.headers).get('Authorization');
+  if (String(url).endsWith('/profile')) {
+    const uuid = { 'Bearer fixture-work': 'work', 'Bearer fixture-off': 'off' }[token] || 'default';
+    return new Response(JSON.stringify({ account: { uuid }, organization: { uuid: 'org' } }));
+  }
+  return new Response(JSON.stringify({ rate_limit: { primary_window: { used_percent: 1 } }, five_hour: { utilization: 1 } }));
+}`,
+  );
+  const daemon = await createTestPaseoDaemon({
+    pluginsEnabled: false,
+    builtinPlugins,
+    providerOverrides: {
+      "claude-work": {
+        extends: "claude",
+        label: "Claude (work)",
+        env: { CLAUDE_CONFIG_DIR: dir("claude-work") },
+      },
+      "claude-same": {
+        extends: "claude",
+        label: "Claude (same)",
+        env: { CLAUDE_CONFIG_DIR: dir("claude-same") },
+      },
+      "claude-off": {
+        extends: "claude",
+        label: "Claude (off)",
+        enabled: false,
+        env: { CLAUDE_CONFIG_DIR: dir("claude-off") },
+      },
+      "codex-work": {
+        extends: "codex",
+        label: "Codex (work)",
+        env: { CODEX_HOME: dir("codex-work") },
+      },
+    },
+  });
+  const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+  const reportIds = async () =>
+    (await client.listUsageReports()).reports.map((entry) => entry.id).sort();
+  try {
+    await client.connect();
+    expect(await reportIds()).toEqual([
+      "claude:default.org",
+      "claude:work.org",
+      "codex:chatgpt-default",
+      "codex:chatgpt-work",
+    ]);
+    await client.patchDaemonConfig({ providers: { "claude-work": { enabled: false } } });
+    expect(await reportIds()).toEqual([
+      "claude:default.org",
+      "codex:chatgpt-default",
+      "codex:chatgpt-work",
+    ]);
   } finally {
     await client.close();
     await daemon.close();
