@@ -33,8 +33,11 @@ interface KnownReport {
 export interface AgentUsageLookup {
   hasAgent(id: string): boolean;
   usageSession(id: string): AgentUsageSession | null;
-  /** Enabled providers that set their own env. Host listings discover these like a session. */
-  providerEnvironments?(): Array<Pick<AgentUsageSession, "provider" | "env">>;
+  /**
+   * Enabled providers that set their own env, with the label to show for their logins. Host
+   * listings discover these like a session.
+   */
+  providerEnvironments?(): Array<Pick<AgentUsageSession, "provider" | "env"> & { label: string }>;
 }
 
 export interface ListUsageReportsOptions {
@@ -100,14 +103,19 @@ export class UsageSourceRegistry {
     } else {
       // A provider's own env can name a login the daemon's env doesn't, so list it before any of
       // its agents runs. The host's own logins come first in each account's fallback order.
-      const scopes: UsageScope[] = [
-        { kind: "global" },
-        ...(this.agents.providerEnvironments?.() ?? []).map(
-          ({ provider, env }): UsageScope => ({ kind: "session", provider, env }),
-        ),
+      // A login is named after the provider it was found through: a login that can't be read
+      // (an expired token has no account) is otherwise one more card that looks like the rest.
+      const scopes: Array<{ scope: UsageScope; harness?: string }> = [
+        { scope: { kind: "global" } },
+        ...(this.agents.providerEnvironments?.() ?? []).map(({ provider, label, env }) => ({
+          scope: { kind: "session" as const, provider, env },
+          harness: label,
+        })),
       ];
       const defaults = new Map<string, KnownReport>();
-      for (const discovered of await Promise.all(scopes.map((scope) => this.discover(scope))))
+      for (const discovered of await Promise.all(
+        scopes.map(({ scope, harness }) => this.discover(scope, harness)),
+      ))
         mergeReports(defaults, discovered);
       this.defaults = defaults;
       this.mergeKnown();
@@ -175,7 +183,7 @@ export class UsageSourceRegistry {
     }
   }
 
-  private async discover(scope: UsageScope): Promise<Map<string, KnownReport>> {
+  private async discover(scope: UsageScope, harness?: string): Promise<Map<string, KnownReport>> {
     const discovered = await Promise.all(
       [...this.sources.values()].map(async (source) => {
         const reports = new Map<string, KnownReport>();
@@ -194,9 +202,12 @@ export class UsageSourceRegistry {
             const id = `${source.id}:${account.key}`;
             const known = reports.get(id);
             // COMPAT(usageLoginHarness): added in v0.11.0, remove after 2027-04-05 once plugin floor >= v0.11.0.
-            const login = { input: account.input, harness: account.harness ?? source.label };
+            const login = {
+              input: account.input,
+              harness: harness ?? account.harness ?? source.label,
+            };
             if (known) {
-              if (!known.logins.some((existing) => loginKey(existing) === loginKey(login)))
+              if (!known.logins.some((existing) => sameLogin(existing, login)))
                 known.logins.push(login);
             } else reports.set(id, { source, logins: [login], label: account.label });
           }
@@ -355,17 +366,25 @@ function mergeReports(
       continue;
     }
     for (const login of report.logins) {
-      if (!known.logins.some((existing) => loginKey(existing) === loginKey(login)))
-        known.logins.push(login);
+      if (!known.logins.some((existing) => sameLogin(existing, login))) known.logins.push(login);
     }
   }
 }
 
 // Inputs are opaque JSON locators. Canonical equality deduplicates discovery across scopes.
+// The harness only names a login, so the scope that finds it first decides what it is called.
+function sameLogin(a: Login, b: Login): boolean {
+  return canonicalJson(a.input) === canonicalJson(b.input);
+}
+
 function loginKey(login: Login): string {
-  return JSON.stringify(login, (_key, value) =>
-    value !== null && typeof value === "object" && !Array.isArray(value)
-      ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)))
-      : value,
+  return canonicalJson(login);
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(value, (_key, nested) =>
+    nested !== null && typeof nested === "object" && !Array.isArray(nested)
+      ? Object.fromEntries(Object.entries(nested).sort(([a], [b]) => a.localeCompare(b)))
+      : nested,
   );
 }

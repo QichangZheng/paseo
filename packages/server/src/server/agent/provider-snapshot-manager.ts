@@ -363,15 +363,20 @@ export class ProviderSnapshotManager {
 
   /**
    * Enabled providers that set their own env, as their sessions report them for usage: the
-   * provider a custom provider extends, and the environment it launches with.
+   * provider a custom provider extends, its own label, and the environment it launches with.
    */
-  listProviderEnvironments(): Array<{ provider: AgentProvider; env: Record<string, string> }> {
+  listProviderEnvironments(): Array<{
+    provider: AgentProvider;
+    label: string;
+    env: Record<string, string>;
+  }> {
     return Object.entries(this.generation.definitions).flatMap(([provider, definition]) => {
       const runtimeSettings = definition.configuration?.runtimeSettings;
       if (!definition.enabled || !runtimeSettings?.env) return [];
       return [
         {
           provider: definition.derivedFromProviderId ?? provider,
+          label: definition.label,
           env: createProviderEnv({ baseEnv: process.env, runtimeSettings }),
         },
       ];

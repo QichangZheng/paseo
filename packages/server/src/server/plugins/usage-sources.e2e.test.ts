@@ -2,7 +2,7 @@ import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { DaemonClient } from "../test-utils/daemon-client.js";
 import { createTestPaseoDaemon } from "../test-utils/paseo-daemon.js";
 import { BuiltinPluginLoader, resolveBuiltinPluginsRoot } from "./builtin/index.js";
@@ -298,7 +298,22 @@ test("built-in sources deduplicate cross-harness accounts and fall back without 
   }
 }, 60_000);
 
+// The daemon launches every provider with its own environment, and a source lists nothing for a
+// provider that sends its agents to another API host. A developer's shell, or the repo's .env,
+// can already set these.
+const API_HOST_ENV = [
+  "ANTHROPIC_BASE_URL",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "OPENAI_BASE_URL",
+];
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 test("#3589: host usage lists each enabled provider's own login without an agent", async () => {
+  for (const name of API_HOST_ENV) vi.stubEnv(name, undefined);
   const root = await mkdtemp(path.join(os.tmpdir(), "usage-provider-env-"));
   const home = path.join(root, "home");
   const dir = (name: string) => path.join(root, name);
@@ -314,6 +329,10 @@ test("#3589: host usage lists each enabled provider's own login without an agent
       claudeAiOauth: { accessToken: `fixture-${name}` },
     });
   }
+  // claude-stale's token expired. Nothing says whose account it is, so it is a card of its own.
+  await json(path.join(dir("claude-stale"), ".credentials.json"), {
+    claudeAiOauth: { accessToken: "fixture-stale", expiresAt: 1 },
+  });
   await json(path.join(dir("codex-work"), "auth.json"), {
     tokens: { access_token: "fixture-codex-work", account_id: "chatgpt-work" },
   });
@@ -343,6 +362,11 @@ test("#3589: host usage lists each enabled provider's own login without an agent
         label: "Claude (same)",
         env: { CLAUDE_CONFIG_DIR: dir("claude-same") },
       },
+      "claude-stale": {
+        extends: "claude",
+        label: "Claude (stale)",
+        env: { CLAUDE_CONFIG_DIR: dir("claude-stale") },
+      },
       "claude-off": {
         extends: "claude",
         label: "Claude (off)",
@@ -357,22 +381,77 @@ test("#3589: host usage lists each enabled provider's own login without an agent
     },
   });
   const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
-  const reportIds = async () =>
-    (await client.listUsageReports()).reports.map((entry) => entry.id).sort();
+  const listed = async (status: "available" | "unavailable") =>
+    (await client.listUsageReports()).reports.filter((entry) => entry.report.status === status);
+  const availableIds = async () => (await listed("available")).map((entry) => entry.id).sort();
   try {
     await client.connect();
-    expect(await reportIds()).toEqual([
+    expect(await availableIds()).toEqual([
       "claude:default.org",
       "claude:work.org",
       "codex:chatgpt-default",
       "codex:chatgpt-work",
     ]);
+    // Several cards can read the same failure, so the card says which provider's login it is.
+    expect((await listed("unavailable")).map((entry) => entry.loginErrors)).toEqual([
+      [
+        {
+          harness: "Claude (stale)",
+          report: {
+            status: "unavailable",
+            problem: {
+              kind: "expired",
+              expiresAt: "1970-01-01T00:00:00.001Z",
+              refreshedBy: "claude",
+            },
+          },
+        },
+      ],
+    ]);
     await client.patchDaemonConfig({ providers: { "claude-work": { enabled: false } } });
-    expect(await reportIds()).toEqual([
+    expect(await availableIds()).toEqual([
       "claude:default.org",
       "codex:chatgpt-default",
       "codex:chatgpt-work",
     ]);
+  } finally {
+    await client.close();
+    await daemon.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+test("#3589: a provider whose agents talk to another API host has no login in the host list", async () => {
+  vi.stubEnv("ANTHROPIC_BASE_URL", "https://llm-proxy.example");
+  const root = await mkdtemp(path.join(os.tmpdir(), "usage-provider-host-"));
+  await json(path.join(root, "claude-work", ".credentials.json"), {
+    claudeAiOauth: { accessToken: "fixture-work" },
+  });
+  const builtinPlugins = await injectedUsageSources(
+    root,
+    { home: path.join(root, "home"), env: {} },
+    `async function fetchApi(url) {
+  if (String(url).endsWith('/profile')) {
+    return new Response(JSON.stringify({ account: { uuid: 'work' }, organization: { uuid: 'org' } }));
+  }
+  return new Response(JSON.stringify({ rate_limit: { primary_window: { used_percent: 1 } }, five_hour: { utilization: 1 } }));
+}`,
+  );
+  const daemon = await createTestPaseoDaemon({
+    pluginsEnabled: false,
+    builtinPlugins,
+    providerOverrides: {
+      "claude-work": {
+        extends: "claude",
+        label: "Claude (work)",
+        env: { CLAUDE_CONFIG_DIR: path.join(root, "claude-work") },
+      },
+    },
+  });
+  const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
+  try {
+    await client.connect();
+    expect((await client.listUsageReports()).reports).toEqual([]);
   } finally {
     await client.close();
     await daemon.close();
