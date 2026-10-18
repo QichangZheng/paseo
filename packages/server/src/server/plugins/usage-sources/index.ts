@@ -41,6 +41,8 @@ interface DiscoverOptions {
   scope: UsageScope;
   /** Names the logins found in this scope; defaults to the account's harness or the source label. */
   harness?: string;
+  /** This scope's last result; a source whose discovery fails keeps its accounts from it. */
+  previous?: ReadonlyMap<string, KnownReport>;
 }
 
 interface MergeReportsOptions {
@@ -67,8 +69,10 @@ export class UsageSourceRegistry {
   private readonly sources = new Map<string, UsageSource>();
   private readonly known = new Map<string, KnownReport>();
   private defaults = new Map<string, KnownReport>();
+  private defaultsByScope = new Map<string, Map<string, KnownReport>>();
   private readonly byAgent = new Map<string, AgentReports>();
   private readonly cache = new Map<string, { at: number; entry: UsageReportEntry }>();
+  private readonly successful = new Map<string, NonNullable<UsageReportEntry["lastSuccessful"]>>();
   private readonly pending = new Map<string, Promise<UsageReportEntry>>();
 
   constructor(
@@ -87,6 +91,8 @@ export class UsageSourceRegistry {
   unregister(id: string): void {
     this.sources.delete(id);
     for (const key of this.defaults.keys()) if (key.startsWith(`${id}:`)) this.defaults.delete(key);
+    for (const reports of this.defaultsByScope.values())
+      for (const key of reports.keys()) if (key.startsWith(`${id}:`)) reports.delete(key);
     // Re-discover on the next session query when a source is replaced.
     for (const [agentId, mapping] of this.byAgent) {
       if ([...mapping.reports.values()].some((report) => report.source.id === id))
@@ -94,6 +100,8 @@ export class UsageSourceRegistry {
     }
     for (const key of this.known.keys()) if (key.startsWith(`${id}:`)) this.known.delete(key);
     for (const key of this.cache.keys()) if (key.startsWith(`${id}:`)) this.cache.delete(key);
+    for (const key of this.successful.keys())
+      if (key.startsWith(`${id}:`)) this.successful.delete(key);
     for (const key of this.pending.keys()) if (key.startsWith(`${id}:`)) this.pending.delete(key);
   }
 
@@ -120,9 +128,19 @@ export class UsageSourceRegistry {
           harness: label,
         })),
       ];
+      // Each scope keeps its own last result, keyed by its launch environment.
+      const previous = this.defaultsByScope;
+      this.defaultsByScope = new Map(
+        await Promise.all(
+          scopes.map(async (entry) => {
+            const key = canonicalJson(entry);
+            return [key, await this.discover({ ...entry, previous: previous.get(key) })] as const;
+          }),
+        ),
+      );
       const defaults = new Map<string, KnownReport>();
-      for (const discovered of await Promise.all(scopes.map((entry) => this.discover(entry))))
-        mergeReports({ into: defaults, reports: discovered });
+      for (const scoped of this.defaultsByScope.values())
+        mergeReports({ into: defaults, reports: scoped });
       this.defaults = defaults;
       this.mergeKnown();
       ids = [...this.known.keys()];
@@ -151,7 +169,11 @@ export class UsageSourceRegistry {
   private async discoverAgent(agentId: string): Promise<string[]> {
     if (!this.agents.hasAgent(agentId)) throw new Error(`Unknown agent: ${agentId}`);
     const session = this.agents.usageSession(agentId);
-    if (!session) return [];
+    if (!session) {
+      this.byAgent.delete(agentId);
+      this.mergeKnown();
+      return [];
+    }
     const previous = this.byAgent.get(agentId);
     const sameScope =
       previous?.sessionKey === session.sessionKey &&
@@ -191,9 +213,27 @@ export class UsageSourceRegistry {
         ),
       });
     }
+    // Fetch freshness expires independently of successful snapshots. Retain only live identities.
+    const active = this.activeCacheKeys();
+    for (const key of this.successful.keys()) if (!active.has(key)) this.successful.delete(key);
+    for (const key of this.cache.keys()) if (!active.has(key)) this.cache.delete(key);
   }
 
-  private async discover({ scope, harness }: DiscoverOptions): Promise<Map<string, KnownReport>> {
+  private activeCacheKeys(): Set<string> {
+    return new Set(
+      [
+        this.known,
+        this.defaults,
+        ...[...this.byAgent.values()].map((agent) => agent.reports),
+      ].flatMap((reports) => [...reports].map(([id, report]) => cacheIdentity(id, report))),
+    );
+  }
+
+  private async discover({
+    scope,
+    harness,
+    previous = new Map(),
+  }: DiscoverOptions): Promise<Map<string, KnownReport>> {
     const discovered = await Promise.all(
       [...this.sources.values()].map(async (source) => {
         const reports = new Map<string, KnownReport>();
@@ -223,6 +263,11 @@ export class UsageSourceRegistry {
           }
         } catch (error) {
           this.logger.warn({ sourceId: source.id, err: error }, "Usage source discovery failed");
+          // A failed store read does not confirm removal. Agent session discovery has no previous
+          // mapping because a resumed agent may use a different launch environment.
+          for (const [id, report] of previous) {
+            if (report.source === source) reports.set(id, report);
+          }
         }
         return reports;
       }),
@@ -261,25 +306,42 @@ export class UsageSourceRegistry {
 
   private fetchId(id: string, known: KnownReport, forceRefresh = false): Promise<UsageReportEntry> {
     // Account identity groups cards; the ordered login set identifies a fetch result.
-    const cacheKey = `${id}:${createHash("sha256")
-      .update(JSON.stringify([known.label, known.logins.map(loginKey)]))
-      .digest("hex")}`;
+    const cacheKey = cacheIdentity(id, known);
     const cached = this.cache.get(cacheKey);
     if (!forceRefresh && cached && this.now() - cached.at < this.ttlMs)
       return Promise.resolve(cached.entry);
     const pending = this.pending.get(cacheKey);
     if (pending) return pending;
     const request = (async () => {
+      const fetchedAt = new Date(this.now()).toISOString();
+      const outcome = await this.fetchWithFallback(known);
+      const completedAt = new Date(this.now()).toISOString();
       const entry: UsageReportEntry = {
         id,
         sourceId: known.source.id,
         sourceLabel: known.source.label,
         icon: known.source.icon,
         account: { label: known.label },
-        fetchedAt: new Date(this.now()).toISOString(),
-        ...(await this.fetchWithFallback(known)),
+        fetchedAt,
+        ...outcome,
       };
-      if (this.sources.get(known.source.id) === known.source) this.writeCache(cacheKey, entry);
+      if (entry.report.status === "available") {
+        entry.successfulAt = completedAt;
+      } else {
+        entry.lastSuccessful = this.successful.get(cacheKey);
+      }
+      if (
+        this.sources.get(known.source.id) === known.source &&
+        this.activeCacheKeys().has(cacheKey)
+      ) {
+        if (entry.report.status === "available") {
+          this.successful.set(cacheKey, {
+            fetchedAt: completedAt,
+            report: entry.report,
+          });
+        }
+        this.writeCache(cacheKey, entry);
+      }
       return entry;
     })();
     this.pending.set(cacheKey, request);
@@ -394,4 +456,10 @@ function canonicalJson(value: unknown): string {
       ? Object.fromEntries(Object.entries(nested).sort(([a], [b]) => a.localeCompare(b)))
       : nested,
   );
+}
+
+function cacheIdentity(id: string, known: KnownReport): string {
+  return `${id}:${createHash("sha256")
+    .update(JSON.stringify([known.label, known.logins.map(loginKey)]))
+    .digest("hex")}`;
 }
