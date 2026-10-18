@@ -18,11 +18,23 @@ async function json(file: string, value: unknown) {
 }
 
 /** The real Claude and Codex readers, compiled as built-ins, with home, env and HTTP injected. */
-async function injectedUsageSources(
-  root: string,
-  lookup: { home: string; env: Record<string, string> },
-  fetchApi: string,
-): Promise<BuiltinPluginLoader> {
+interface UsageLookup {
+  home: string;
+  env: Record<string, string>;
+}
+
+interface InjectedUsageSourcesOptions {
+  root: string;
+  lookup: UsageLookup;
+  /** Source of an `async function fetchApi(url, init)` the readers call instead of the network. */
+  fetchApi: string;
+}
+
+async function injectedUsageSources({
+  root,
+  lookup,
+  fetchApi,
+}: InjectedUsageSourcesOptions): Promise<BuiltinPluginLoader> {
   const plugins = path.join(root, "plugins");
   for (const source of ["codex", "claude"]) {
     const directory = path.join(plugins, `${source}-usage-source`);
@@ -233,10 +245,10 @@ test("built-in sources deduplicate cross-harness accounts and fall back without 
     JSON.stringify({ access: "fixture-omp-claude", expires: Date.now() + 60_000 }),
   );
   db.close();
-  const builtinPlugins = await injectedUsageSources(
-    root,
-    { home, env },
-    `async function fetchApi(url, init) {
+  const builtinPlugins = await injectedUsageSources({
+    root: root,
+    lookup: { home, env },
+    fetchApi: `async function fetchApi(url, init) {
   const token = new Headers(init.headers).get('Authorization');
   if (String(url).endsWith('/profile')) {
     const second = token === 'Bearer fixture-pi-claude';
@@ -246,7 +258,7 @@ test("built-in sources deduplicate cross-harness accounts and fall back without 
   const used = { 'Bearer fixture-codex': 11, 'Bearer fixture-opencode': 22, 'Bearer fixture-pi-codex': 33, 'Bearer fixture-omp-codex': 44, 'Bearer fixture-omp-claude': 66, 'Bearer fixture-pi-claude': 77 }[token] || 55;
   return new Response(JSON.stringify({ rate_limit: { primary_window: { used_percent: used } }, five_hour: { utilization: used } }));
 }`,
-  );
+  });
   const daemon = await createTestPaseoDaemon({ pluginsEnabled: false, builtinPlugins });
   const client = new DaemonClient({ url: `ws://127.0.0.1:${daemon.port}/ws` });
   try {
@@ -336,10 +348,10 @@ test("#3589: host usage lists each enabled provider's own login without an agent
   await json(path.join(dir("codex-work"), "auth.json"), {
     tokens: { access_token: "fixture-codex-work", account_id: "chatgpt-work" },
   });
-  const builtinPlugins = await injectedUsageSources(
-    root,
-    { home, env: {} },
-    `async function fetchApi(url, init) {
+  const builtinPlugins = await injectedUsageSources({
+    root: root,
+    lookup: { home, env: {} },
+    fetchApi: `async function fetchApi(url, init) {
   const token = new Headers(init.headers).get('Authorization');
   if (String(url).endsWith('/profile')) {
     const uuid = { 'Bearer fixture-work': 'work', 'Bearer fixture-off': 'off' }[token] || 'default';
@@ -347,7 +359,7 @@ test("#3589: host usage lists each enabled provider's own login without an agent
   }
   return new Response(JSON.stringify({ rate_limit: { primary_window: { used_percent: 1 } }, five_hour: { utilization: 1 } }));
 }`,
-  );
+  });
   const daemon = await createTestPaseoDaemon({
     pluginsEnabled: false,
     builtinPlugins,
@@ -427,16 +439,16 @@ test("#3589: a provider whose agents talk to another API host has no login in th
   await json(path.join(root, "claude-work", ".credentials.json"), {
     claudeAiOauth: { accessToken: "fixture-work" },
   });
-  const builtinPlugins = await injectedUsageSources(
-    root,
-    { home: path.join(root, "home"), env: {} },
-    `async function fetchApi(url) {
+  const builtinPlugins = await injectedUsageSources({
+    root: root,
+    lookup: { home: path.join(root, "home"), env: {} },
+    fetchApi: `async function fetchApi(url) {
   if (String(url).endsWith('/profile')) {
     return new Response(JSON.stringify({ account: { uuid: 'work' }, organization: { uuid: 'org' } }));
   }
   return new Response(JSON.stringify({ rate_limit: { primary_window: { used_percent: 1 } }, five_hour: { utilization: 1 } }));
 }`,
-  );
+  });
   const daemon = await createTestPaseoDaemon({
     pluginsEnabled: false,
     builtinPlugins,

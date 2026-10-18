@@ -19,6 +19,7 @@ import {
   type AgentProvider,
   type FetchCatalogOptions,
   type ProviderSnapshotEntry,
+  type ProviderUsageEnvironment,
 } from "./agent-sdk-types.js";
 import {
   raceProviderRefreshAbort,
@@ -361,15 +362,8 @@ export class ProviderSnapshotManager {
     return this.createAgentManagerState(this.generation.definitions, this.providerClients);
   }
 
-  /**
-   * Enabled providers that set their own env, as their sessions report them for usage: the
-   * provider a custom provider extends, its own label, and the environment it launches with.
-   */
-  listProviderEnvironments(): Array<{
-    provider: AgentProvider;
-    label: string;
-    env: Record<string, string>;
-  }> {
+  /** Enabled providers that set their own env, as their sessions report them for usage. */
+  listProviderEnvironments(): ProviderUsageEnvironment[] {
     return Object.entries(this.generation.definitions).flatMap(([provider, definition]) => {
       const runtimeSettings = definition.configuration?.runtimeSettings;
       if (!definition.enabled || !runtimeSettings?.env) return [];

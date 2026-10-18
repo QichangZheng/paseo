@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { AgentUsageSession } from "../../agent/agent-sdk-types.js";
+import type { AgentUsageSession, ProviderUsageEnvironment } from "../../agent/agent-sdk-types.js";
 import type { UsageScope } from "@getpaseo/plugin/server/usage";
 import { z } from "zod";
 import type { Logger } from "pino";
@@ -33,11 +33,19 @@ interface KnownReport {
 export interface AgentUsageLookup {
   hasAgent(id: string): boolean;
   usageSession(id: string): AgentUsageSession | null;
-  /**
-   * Enabled providers that set their own env, with the label to show for their logins. Host
-   * listings discover these like a session.
-   */
-  providerEnvironments?(): Array<Pick<AgentUsageSession, "provider" | "env"> & { label: string }>;
+  /** Enabled providers that set their own env. Host listings discover these like a session. */
+  providerEnvironments?(): ProviderUsageEnvironment[];
+}
+
+interface DiscoverOptions {
+  scope: UsageScope;
+  /** Names the logins found in this scope; defaults to the account's harness or the source label. */
+  harness?: string;
+}
+
+interface MergeReportsOptions {
+  into: Map<string, KnownReport>;
+  reports: Iterable<[string, KnownReport]>;
 }
 
 export interface ListUsageReportsOptions {
@@ -105,7 +113,7 @@ export class UsageSourceRegistry {
       // its agents runs. The host's own logins come first in each account's fallback order.
       // A login is named after the provider it was found through: a login that can't be read
       // (an expired token has no account) is otherwise one more card that looks like the rest.
-      const scopes: Array<{ scope: UsageScope; harness?: string }> = [
+      const scopes: DiscoverOptions[] = [
         { scope: { kind: "global" } },
         ...(this.agents.providerEnvironments?.() ?? []).map(({ provider, label, env }) => ({
           scope: { kind: "session" as const, provider, env },
@@ -113,10 +121,8 @@ export class UsageSourceRegistry {
         })),
       ];
       const defaults = new Map<string, KnownReport>();
-      for (const discovered of await Promise.all(
-        scopes.map(({ scope, harness }) => this.discover(scope, harness)),
-      ))
-        mergeReports(defaults, discovered);
+      for (const discovered of await Promise.all(scopes.map((entry) => this.discover(entry))))
+        mergeReports({ into: defaults, reports: discovered });
       this.defaults = defaults;
       this.mergeKnown();
       ids = [...this.known.keys()];
@@ -153,10 +159,12 @@ export class UsageSourceRegistry {
       previous.model === session.model;
     if (sameScope) return [...previous.reports.keys()];
     const reports = await this.discover({
-      kind: "session",
-      provider: session.provider,
-      model: session.model,
-      env: session.env,
+      scope: {
+        kind: "session",
+        provider: session.provider,
+        model: session.model,
+        env: session.env,
+      },
     });
     // A query that finishes after a resume must not publish the previous launch's mapping.
     if (this.agents.usageSession(agentId)?.sessionKey !== session.sessionKey) return [];
@@ -176,14 +184,16 @@ export class UsageSourceRegistry {
       this.defaults,
       ...[...this.byAgent.values()].map((agent) => agent.reports),
     ]) {
-      mergeReports(
-        this.known,
-        [...reports].filter(([, report]) => this.sources.get(report.source.id) === report.source),
-      );
+      mergeReports({
+        into: this.known,
+        reports: [...reports].filter(
+          ([, report]) => this.sources.get(report.source.id) === report.source,
+        ),
+      });
     }
   }
 
-  private async discover(scope: UsageScope, harness?: string): Promise<Map<string, KnownReport>> {
+  private async discover({ scope, harness }: DiscoverOptions): Promise<Map<string, KnownReport>> {
     const discovered = await Promise.all(
       [...this.sources.values()].map(async (source) => {
         const reports = new Map<string, KnownReport>();
@@ -355,10 +365,7 @@ function legacyError(report: UsageReport, now: number): string | null {
 }
 
 // An account found in several scopes is one report; its logins keep discovery order, once each.
-function mergeReports(
-  into: Map<string, KnownReport>,
-  reports: Iterable<[string, KnownReport]>,
-): void {
+function mergeReports({ into, reports }: MergeReportsOptions): void {
   for (const [id, report] of reports) {
     const known = into.get(id);
     if (!known) {
