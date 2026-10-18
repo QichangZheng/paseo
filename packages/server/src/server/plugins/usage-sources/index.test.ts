@@ -861,6 +861,9 @@ test("#3589: a provider's failed discovery keeps only that provider's last login
   expect(await listIds()).toEqual(["claude:default", "claude:work"]);
   failing.add("/work");
   expect(await listIds()).toEqual(["claude:default", "claude:work"]);
+  // Renaming a provider keeps its launch environment.
+  providers = [{ provider: "claude", label: "Claude (Work)", env: { CLAUDE_CONFIG_DIR: "/work" } }];
+  expect(await listIds()).toEqual(["claude:default", "claude:work"]);
   // A changed launch environment has no previous result to keep.
   providers = [
     { provider: "claude", label: "Claude (work)", env: { CLAUDE_CONFIG_DIR: "/other" } },
@@ -874,4 +877,22 @@ test("#3589: a provider's failed discovery keeps only that provider's last login
   providers = [];
   failing.add("/default");
   expect(await listIds()).toEqual(["claude:default"]);
+});
+
+test("unregistering a source drops the accounts each host scope kept for it", async () => {
+  let fails = false;
+  const registry = new UsageSourceRegistry(Date.now, 300_000, { warn: () => {} });
+  const claude = source({
+    id: "claude",
+    discover: async () => {
+      if (fails) throw new Error("Login store temporarily unavailable");
+      return [{ key: "default", input: {} }];
+    },
+  });
+  registry.register(claude);
+  expect((await registry.listReports()).map((entry) => entry.id)).toEqual(["claude:default"]);
+  registry.unregister("claude");
+  registry.register(claude);
+  fails = true;
+  expect(await registry.listReports()).toEqual([]);
 });

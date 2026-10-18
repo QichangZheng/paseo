@@ -128,14 +128,20 @@ export class UsageSourceRegistry {
           harness: label,
         })),
       ];
-      // Each scope keeps its own last result, keyed by its launch environment.
+      // Each launch environment is discovered once, under the first provider that uses it, and
+      // keeps its own last result.
+      const unique = new Map<string, DiscoverOptions>();
+      for (const entry of scopes) {
+        const key = canonicalJson(entry.scope);
+        if (!unique.has(key)) unique.set(key, entry);
+      }
       const previous = this.defaultsByScope;
       this.defaultsByScope = new Map(
         await Promise.all(
-          scopes.map(async (entry) => {
-            const key = canonicalJson(entry);
-            return [key, await this.discover({ ...entry, previous: previous.get(key) })] as const;
-          }),
+          [...unique].map(
+            async ([key, entry]) =>
+              [key, await this.discover({ ...entry, previous: previous.get(key) })] as const,
+          ),
         ),
       );
       const defaults = new Map<string, KnownReport>();
